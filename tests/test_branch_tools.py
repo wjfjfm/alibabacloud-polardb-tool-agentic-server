@@ -11,6 +11,7 @@ from server.core.responses import error_response
 from server.core.sql_executor import RateLimitError, SQLExecutionError, reset_rate_limiters
 from server.models import AuditStatus, Permission
 from server.mcp.tools.branch_handler import (
+    _BranchContext,
     _execute_branch_sql,
     _resolve_branch_context,
     handle_create_branch,
@@ -33,8 +34,8 @@ def _user():
     return SimpleNamespace(id="uid", display_name="User")
 
 
-def _target_instance():
-    return SimpleNamespace(id="iid", name="inst")
+def _branch_context():
+    return _credential_context(SimpleNamespace(id="iid", name="inst"))
 
 
 def _credential_context(target_instance, permission=Permission.READWRITE):
@@ -42,11 +43,12 @@ def _credential_context(target_instance, permission=Permission.READWRITE):
         username_ciphertext="encrypted-user",
         password_ciphertext="encrypted-password",
     )
-    return (
-        target_instance,
-        SimpleNamespace(),
-        credential,
-        permission,
+    return _BranchContext(
+        instance=target_instance,
+        credential=credential,
+        permission=permission,
+        public_instance_id=target_instance.id,
+        target_type="instance",
     )
 
 
@@ -138,77 +140,36 @@ async def test_resolve_branch_context_wraps_account_creation_failure():
     }
 
 
-async def test_resolve_branch_context_ensures_multitenant_account_when_missing():
+@pytest.mark.parametrize("topology", ["SINGLE_TENANT", "MULTITENANT"])
+async def test_branch_context_missing_credential_never_provisions(topology):
     from server.models import InstanceStatus, InstanceTopology
 
     user = SimpleNamespace(id="uid", display_name="User", status=None)
-    result_proxy = SimpleNamespace(scalar_one_or_none=lambda: None)
-    session = SimpleNamespace(execute=AsyncMock(return_value=result_proxy))
-    target_instance = SimpleNamespace(
-        id="iid",
-        status=InstanceStatus.ACTIVE,
-        topology=InstanceTopology.MULTITENANT,
-    )
-    credential_context = _credential_context(target_instance)
-
+    session = AsyncMock()
+    instance = SimpleNamespace(id="iid", status=InstanceStatus.ACTIVE,
+                               topology=getattr(InstanceTopology, topology))
     with (
-        patch(
-            "server.mcp.tools.branch_handler.resolve_target_instance",
-            new_callable=AsyncMock,
-            return_value=(target_instance, []),
-        ),
-        patch(
-            "server.mcp.tools.branch_handler._resolve_user_sql_credential",
-            new_callable=AsyncMock,
-            return_value=_resolved_credential(),
-        ) as resolve_credential,
+        patch("server.mcp.tools.branch_handler.resolve_target_instance",
+              new=AsyncMock(return_value=(instance, []))),
+        patch("server.mcp.tools.handlers.resolve_user_instance_access",
+              new=AsyncMock(return_value=SimpleNamespace(permission=Permission.READWRITE))),
+        patch("server.mcp.tools.handlers.get_user_credential", new=AsyncMock(return_value=None)),
+        patch("server.mcp.tools.handlers.create_db_account", new_callable=AsyncMock) as create_account,
+        patch("server.core.tenant_provisioner.ensure_tenant", new_callable=AsyncMock) as create_tenant,
     ):
         result = await _resolve_branch_context(user, session, instance_id="iid")
-
-    resolve_credential.assert_awaited_once_with(
-        user, target_instance, session
-    )
-    assert result == credential_context
-
-
-async def test_resolve_branch_context_resumes_incomplete_multitenant_account():
-    from server.models import InstanceStatus, InstanceTopology
-
-    user = SimpleNamespace(id="uid", display_name="User", status=None)
-    result_proxy = SimpleNamespace(scalar_one_or_none=lambda: None)
-    session = SimpleNamespace(execute=AsyncMock(return_value=result_proxy))
-    target_instance = SimpleNamespace(
-        id="iid",
-        status=InstanceStatus.ACTIVE,
-        topology=InstanceTopology.MULTITENANT,
-    )
-    credential_context = _credential_context(target_instance)
-
-    with (
-        patch(
-            "server.mcp.tools.branch_handler.resolve_target_instance",
-            new_callable=AsyncMock,
-            return_value=(target_instance, []),
-        ),
-        patch(
-            "server.mcp.tools.branch_handler._resolve_user_sql_credential",
-            new_callable=AsyncMock,
-            return_value=_resolved_credential(),
-        ) as resolve_credential,
-    ):
-        result = await _resolve_branch_context(user, session, instance_id="iid")
-
-    resolve_credential.assert_awaited_once_with(
-        user, target_instance, session
-    )
-    assert result == credential_context
+    assert json.loads(result["content"][0]["text"])["error"] == "CONNECTION_ERROR"
+    create_account.assert_not_awaited()
+    create_tenant.assert_not_awaited()
+    session.commit.assert_not_awaited()
+    session.add.assert_not_called()
 
 
 async def test_list_branches_maps_show_branches_rows():
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=({"columns": ["Branch"], "rows": [["MAIN"], ["br1"]]}, _target_instance()),
+        return_value=({"columns": ["Branch"], "rows": [["MAIN"], ["br1"]]}, _branch_context()),
     ) as execute, patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock):
         result = await handle_list_branches(_user(), object(), instance_id="iid")
 
@@ -229,7 +190,7 @@ async def test_list_branches_exposes_truncated_result():
         new_callable=AsyncMock,
         return_value=(
             {"columns": ["Branch"], "rows": [["MAIN"]], "truncated": True},
-            _target_instance(),
+            _branch_context(),
         ),
     ), patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock):
         result = await handle_list_branches(_user(), object(), instance_id="iid")
@@ -245,7 +206,7 @@ async def test_list_branches_finds_branch_column_case_insensitively():
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=({"columns": ["Database", " branch "], "rows": [["app", "br1"]]}, _target_instance()),
+        return_value=({"columns": ["Database", " branch "], "rows": [["app", "br1"]]}, _branch_context()),
     ), patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock):
         result = await handle_list_branches(_user(), object(), instance_id="iid")
 
@@ -254,12 +215,12 @@ async def test_list_branches_finds_branch_column_case_insensitively():
 
 
 async def test_list_branches_rejects_unexpected_columns():
-    target_instance = _target_instance()
+    context = _branch_context()
     user = _user()
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=({"columns": ["Database"], "rows": [["app"]]}, target_instance),
+        return_value=({"columns": ["Database"], "rows": [["app"]]}, context),
     ), patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock) as log:
         result = await handle_list_branches(user, object(), instance_id="iid")
 
@@ -271,12 +232,12 @@ async def test_list_branches_rejects_unexpected_columns():
 
 
 async def test_list_branches_rejects_missing_column_metadata():
-    target_instance = _target_instance()
+    context = _branch_context()
     user = _user()
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=({"columns": [], "rows": [["MAIN"]]}, target_instance),
+        return_value=({"columns": [], "rows": [["MAIN"]]}, context),
     ), patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock) as log:
         result = await handle_list_branches(user, object(), instance_id="iid")
 
@@ -288,12 +249,12 @@ async def test_list_branches_rejects_missing_column_metadata():
 
 
 async def test_list_branches_rejects_rows_missing_branch_column():
-    target_instance = _target_instance()
+    context = _branch_context()
     user = _user()
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=({"columns": ["Database", "Branch"], "rows": [["app"]]}, target_instance),
+        return_value=({"columns": ["Database", "Branch"], "rows": [["app"]]}, context),
     ), patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock) as log:
         result = await handle_list_branches(user, object(), instance_id="iid")
 
@@ -305,12 +266,12 @@ async def test_list_branches_rejects_rows_missing_branch_column():
 
 
 async def test_list_branches_logs_success_after_parsing():
-    target_instance = _target_instance()
+    context = _branch_context()
     user = _user()
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=({"columns": ["Branch"], "rows": [["MAIN"], ["br1"]]}, target_instance),
+        return_value=({"columns": ["Branch"], "rows": [["MAIN"], ["br1"]]}, context),
     ), patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock) as log:
         result = await handle_list_branches(user, object(), instance_id="iid")
 
@@ -330,7 +291,7 @@ async def test_branch_tools_do_not_echo_instance_metadata():
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=(gateway_result, _target_instance()),
+        return_value=(gateway_result, _branch_context()),
     ), patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock):
         list_result = await handle_list_branches(_user(), object(), instance_id="iid")
 
@@ -348,7 +309,7 @@ async def test_branch_tools_do_not_echo_instance_metadata():
     with patch(
         "server.mcp.tools.branch_handler._execute_branch_sql",
         new_callable=AsyncMock,
-        return_value=(command_result, _target_instance()),
+        return_value=(command_result, _branch_context()),
     ):
         create_result = await handle_create_branch(
             object(), object(), branch_name="br_new", instance_id="iid",
@@ -475,7 +436,10 @@ async def test_execute_branch_sql_rate_limits_before_resolving_context():
         patch("server.mcp.tools.branch_handler.get_gateway") as get_gateway,
         patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock) as log,
     ):
-        result = await _execute_branch_sql(user, session, sql="CREATE BRANCH br1", action="create_branch")
+        result = await _execute_branch_sql(
+            user, session, sql="CREATE BRANCH br1", action="create_branch",
+            instance_id="dbi-unresolved",
+        )
 
     resolve_context.assert_not_awaited()
     get_gateway.assert_not_called()
@@ -484,6 +448,9 @@ async def test_execute_branch_sql_rate_limits_before_resolving_context():
     assert payload == {"error": "RATE_LIMITED", "message": "Too many requests. Please slow down."}
     assert log.await_args.kwargs["status"] == AuditStatus.BLOCKED
     assert log.await_args.kwargs["error_message"] == "Rate limited"
+    assert log.await_args.kwargs["target_id"] == "dbi-unresolved"
+    assert "target_type" not in log.await_args.kwargs
+    assert "instance_id" not in log.await_args.kwargs
 
 
 async def test_execute_branch_sql_rejects_disabled_user_before_rate_limit():
@@ -581,7 +548,8 @@ async def test_execute_branch_sql_delegates_permissions_to_database():
     assert gateway.execute.await_args.kwargs["branch"] == ""
 
 
-async def test_execute_branch_sql_forces_read_only_for_readonly_credential():
+@pytest.mark.parametrize("sql,action", [("CREATE BRANCH br1", "create_branch"), ("DROP BRANCH br1", "delete_branch")])
+async def test_execute_branch_sql_blocks_writes_for_readonly_credential(sql, action):
     user = SimpleNamespace(id="uid", display_name="User")
     session = object()
     target_instance = SimpleNamespace(
@@ -614,14 +582,12 @@ async def test_execute_branch_sql_forces_read_only_for_readonly_credential():
             new_callable=AsyncMock,
         ),
     ):
-        await _execute_branch_sql(
-            user,
-            session,
-            sql="CREATE BRANCH br1",
-            action="create_branch",
+        result = await _execute_branch_sql(
+            user, session, sql=sql, action=action,
         )
 
-    assert gateway.execute.await_args.kwargs["read_only"] is True
+    gateway.execute.assert_not_awaited()
+    assert json.loads(result["content"][0]["text"])["error"] == "READ_ONLY_ACCESS"
 
 
 async def test_execute_branch_sql_marks_list_as_read_only():
@@ -652,7 +618,7 @@ async def test_execute_branch_sql_marks_list_as_read_only():
 
     assert result == (
         {"columns": ["Branch"], "rows": [("MAIN",)], "row_count": 1, "truncated": False},
-        target_instance,
+        _credential_context(target_instance),
     )
     assert gateway.execute.await_args.kwargs["read_only"] is True
     assert gateway.execute.await_args.kwargs["branch"] == ""
@@ -676,13 +642,13 @@ async def test_execute_branch_sql_logs_success_audit_fields():
     ):
         result = await _execute_branch_sql(user, session, sql="DROP BRANCH br1", action="delete_branch")
 
-    assert result == ({"columns": [], "rows": [], "row_count": 0}, target_instance)
+    assert result == ({"columns": [], "rows": [], "row_count": 0}, _credential_context(target_instance))
     assert log.await_args.kwargs["instance_id"] == "iid"
     assert log.await_args.kwargs["action"] == "delete_branch"
     assert "sql_text" not in log.await_args.kwargs
     assert log.await_args.kwargs["status"] == AuditStatus.SUCCESS
     assert log.await_args.kwargs["row_count"] == 0
-    assert "user_name" not in log.await_args.kwargs
+    assert log.await_args.kwargs["user_name"] == "User"
     assert "instance_name" not in log.await_args.kwargs
 
 
@@ -730,7 +696,7 @@ async def test_execute_branch_sql_can_skip_success_audit():
             log_success=False,
         )
 
-    assert result == ({"columns": ["Branch"], "rows": [["MAIN"]]}, target_instance)
+    assert result == ({"columns": ["Branch"], "rows": [["MAIN"]]}, _credential_context(target_instance))
     log.assert_not_awaited()
 
 
@@ -1133,6 +1099,39 @@ async def test_delete_branch_returns_sql_error():
     assert result["isError"] is True
     payload = json.loads(result["content"][0]["text"])
     assert payload == {"error": "SQL_ERROR", "message": "Branch does not exist"}
+
+
+@pytest.mark.parametrize("inventory,expected,calls", [
+    ({"columns": ["Branch"], "rows": [["MAIN"]]}, "not_found", 1),
+    ({"columns": ["Branch"], "rows": [["br"]]}, "deleted", 2),
+    ({"columns": ["Branch"], "rows": [["BR"]]}, "not_found", 1),
+    ({"columns": ["Branch"], "rows": [], "truncated": True}, "UNEXPECTED_RESULT", 1),
+    ({"columns": [], "rows": []}, "UNEXPECTED_RESULT", 1),
+])
+async def test_delete_branch_checks_complete_inventory(inventory, expected, calls):
+    instance = SimpleNamespace(id="iid", host="h", port=3306)
+    gateway = SimpleNamespace(execute=AsyncMock(side_effect=[inventory, {"row_count": 0}]))
+    with (
+        patch("server.mcp.tools.branch_handler._resolve_branch_context", new_callable=AsyncMock,
+              return_value=_credential_context(instance)),
+        patch("server.mcp.tools.branch_handler.decrypt", return_value="pw"),
+        patch("server.mcp.tools.branch_handler.get_gateway", return_value=gateway),
+        patch("server.mcp.tools.branch_handler.log_audit", new_callable=AsyncMock),
+    ):
+        result = await handle_delete_branch(_user(), object(), branch_name="br")
+    payload = json.loads(result["content"][0]["text"])
+    assert payload.get("error", payload.get("status")) == expected
+    assert gateway.execute.await_count == calls
+    assert gateway.execute.await_args_list[0].kwargs["sql"] == "SHOW BRANCHES"
+
+
+async def test_lost_connection_reports_uncertain_outcome_without_native_details():
+    from server.core.sql_gateway import _sanitized_sql_error
+
+    error = _sanitized_sql_error(Exception(2013, "private database endpoint"))
+    assert error.code == "DB_CONNECTION_LOST"
+    assert "verify" in error.message.lower()
+    assert "private" not in error.message
 
 
 async def test_delete_branch_timeout_returns_unknown_status():

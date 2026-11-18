@@ -4,6 +4,7 @@ import logging
 import os
 import time
 import uuid
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, patch
 
@@ -45,13 +46,14 @@ from server.models import (
     User,
     UserInstanceBinding,
     UserRole,
+    UserWorkspace,
 )
 from server.core.agent_user_token_service import issue_token
 from server.core.crypto import encrypt
 from server.mcp.transport import mcp_lifespan, reset_mcp
 
 
-def _create_mcp_token(user_id: str, credential_epoch: int) -> str:
+def _create_mcp_token(user_id: str, credential_epoch: int, agent_id: str | None = None) -> str:
     """Create a valid MCP access token accepted by PASAuthProvider.load_access_token()."""
     private_key, _ = _load_keys()
     config = get_config()
@@ -66,6 +68,7 @@ def _create_mcp_token(user_id: str, credential_epoch: int) -> str:
             "exp": now + 3600,
             "type": "access",
             "credential_epoch": credential_epoch,
+            "agent_id": agent_id,
             "client_id": "test-client",
             "scope": "",
         },
@@ -281,14 +284,29 @@ async def test_personal_mcp_uses_user_grants_without_agent(client, setup_data, a
     names = {item["name"] for item in _parse_sse_response(response.text)[0]["result"]["tools"]}
     assert {"run_sql", "list_db_instances", "describe_schema"} <= names
     assert "create_db_instance" not in names
-    assert not names.intersection({"create_branch", "delete_branch", "set_default_instance", "doc_delete", "doc_rechunk"})
+    assert {"list_branches", "create_branch", "delete_branch"} <= names
+    assert not names.intersection({"set_default_instance", "doc_delete", "doc_rechunk"})
     tools = _parse_sse_response(response.text)[0]["result"]["tools"]
     sql_schema = next(item["inputSchema"] for item in tools if item["name"] == "run_sql")
     assert "instance_id" in sql_schema["required"]
-    assert "branch" not in sql_schema["properties"]
-    for tool, arguments in [("create_branch", {}), ("doc_delete", {}), ("run_sql", {"sql": "SELECT 1"}), ("run_sql", {"sql": "SELECT 1", "instance_id": setup_data["instance"].id, "branch": "main"})]:
+    assert "branch" in sql_schema["properties"]
+    for item in tools:
+        if item["name"] in {"list_branches", "create_branch", "delete_branch"}:
+            assert "instance_id" in item["inputSchema"]["required"]
+    for tool, arguments in [("create_branch", {}), ("doc_delete", {}), ("run_sql", {"sql": "SELECT 1"})]:
         denied = await client.post("/mcp/personal", headers=headers, json=_jsonrpc("tools/call", {"name": tool, "arguments": arguments}))
         assert _parse_sse_response(denied.text)[0]["result"]["isError"]
+
+    with patch("server.mcp.tools.branch_handler.get_gateway") as gateway:
+        for tool in ("create_branch", "delete_branch"):
+            response = await client.post("/mcp/personal", headers=headers,
+                json=_jsonrpc("tools/call", {"name": tool, "arguments": {
+                    "instance_id": setup_data["instance"].id, "branch_name": "blocked",
+                }}))
+            result = _parse_sse_response(response.text)[0]["result"]
+            assert result["isError"]
+            assert json.loads(result["content"][0]["text"])["error"] == "READ_ONLY_ACCESS"
+        gateway.assert_not_called()
 
     response = await client.post("/mcp/personal", headers=headers,
         json=_jsonrpc("tools/call", {"name": "list_db_instances", "arguments": {}}))
@@ -302,10 +320,11 @@ async def test_personal_mcp_uses_user_grants_without_agent(client, setup_data, a
                return_value={"content": [{"type": "text", "text": "ok"}]}) as run:
         response = await client.post("/mcp/personal", headers=headers,
             json=_jsonrpc("tools/call", {"name": "run_sql", "arguments": {
-                "instance_id": setup_data["instance"].id, "sql": "SELECT 1"}}))
+                "instance_id": setup_data["instance"].id, "sql": "SELECT 1", "branch": "test_branch"}}))
         assert response.status_code == 200
         assert isinstance(run.call_args.args[0], User)
         assert run.call_args.args[0].id == user_id
+        assert run.call_args.kwargs["branch"] == "test_branch"
 
     async with factory() as session:
         binding = await session.get(UserInstanceBinding, binding_id)
@@ -314,6 +333,7 @@ async def test_personal_mcp_uses_user_grants_without_agent(client, setup_data, a
     response = await client.post("/mcp/personal", headers=headers, json=_jsonrpc("tools/list"))
     names = {item["name"] for item in _parse_sse_response(response.text)[0]["result"]["tools"]}
     assert "run_sql" not in names
+    assert not names.intersection({"list_branches", "create_branch", "delete_branch"})
     assert "list_db_instances" not in names
 
 
@@ -466,9 +486,7 @@ class TestMCPTransportTools:
         } & set(names)
         assert "set_default_instance" not in names
         assert "run_sql_transaction" in names
-        assert "list_branches" not in names
-        assert "create_branch" not in names
-        assert "delete_branch" not in names
+        assert {"list_branches", "create_branch", "delete_branch"} <= set(names)
         assert not {
             "prepare_document_upload",
             "complete_document_upload",
@@ -636,13 +654,10 @@ class TestMCPTransportTools:
         by_name = {tool["name"]: tool for tool in tools}
         run_sql = by_name["run_sql"]
         assert "instance_id" in run_sql["inputSchema"]["required"]
-        assert "branch" not in run_sql["inputSchema"]["properties"]
-        assert not {
-            "set_default_instance",
-            "list_branches",
-            "create_branch",
-            "delete_branch",
-        } & set(by_name)
+        assert "branch" in run_sql["inputSchema"]["properties"]
+        assert "set_default_instance" not in by_name
+        for name in ("list_branches", "create_branch", "delete_branch"):
+            assert "instance_id" in by_name[name]["inputSchema"]["required"]
 
     async def test_branch_tool_schema_matches_rest_contract(
         self, client, auth_headers, rest_auth_headers
@@ -666,7 +681,10 @@ class TestMCPTransportTools:
 
         mcp_branch_tools = {t["name"]: t for t in mcp_tools if "branch" in t["name"]}
         rest_branch_tools = {t["name"]: t for t in rest_tools if "branch" in t["name"]}
-        assert mcp_branch_tools == {}
+        assert set(mcp_branch_tools) == set(rest_branch_tools)
+        for name, tool in mcp_branch_tools.items():
+            assert "instance_id" in tool["inputSchema"]["required"]
+            assert tool["annotations"] == rest_branch_tools[name]["annotations"]
         assert set(rest_branch_tools) == {
             "list_branches",
             "create_branch",
@@ -694,14 +712,14 @@ class TestMCPTransportTools:
         run_sql = next(t for t in tools if t["name"] == "run_sql")
         rest_tools = rest_resp.json()["tools"]
         rest_run_sql = next(t for t in rest_tools if t["name"] == "run_sql")
-        assert "branch" not in run_sql["inputSchema"]["properties"]
+        assert "branch" in run_sql["inputSchema"]["properties"]
         assert "instance_id" in run_sql["inputSchema"]["required"]
         assert "branch" in rest_run_sql["inputSchema"]["properties"]
 
         run_sql_transaction = next(t for t in tools if t["name"] == "run_sql_transaction")
         rest_transaction = next(t for t in rest_tools if t["name"] == "run_sql_transaction")
-        assert "branch" not in run_sql_transaction["inputSchema"]["properties"]
-        assert "branch" not in rest_transaction["inputSchema"]["properties"]
+        assert "branch" in run_sql_transaction["inputSchema"]["properties"]
+        assert "branch" in rest_transaction["inputSchema"]["properties"]
 
     async def test_branch_tool_calls_dispatch(self, client, auth_headers, setup_data):
         session_id = await self._initialize(client, auth_headers)
@@ -767,6 +785,9 @@ class TestMCPTransportTools:
             )
         assert payload == {"branches": []}
         assert list_branches.await_args.kwargs["instance_id"] == setup_data["instance"].id
+        actor = list_branches.await_args.args[0]
+        assert actor.user.id == setup_data["admin"].id
+        assert actor.agent.id == setup_data["agent"].id
 
         with patch("server.mcp.transport.handle_create_branch",
                    new_callable=AsyncMock, return_value=create_result) as create_branch:
@@ -781,6 +802,9 @@ class TestMCPTransportTools:
             )
         assert payload == {"branch_name": "br_new", "status": "created"}
         assert create_branch.await_args.kwargs["instance_id"] == setup_data["instance"].id
+        actor = create_branch.await_args.args[0]
+        assert actor.user.id == setup_data["admin"].id
+        assert actor.agent.id == setup_data["agent"].id
         assert create_branch.await_args.kwargs["branch_name"] == "br_new"
         assert create_branch.await_args.kwargs["include_databases"] == ["db1"]
 
@@ -796,167 +820,138 @@ class TestMCPTransportTools:
             )
         assert payload == {"branch_name": "br_old", "status": "deleted"}
         assert delete_branch.await_args.kwargs["instance_id"] == setup_data["instance"].id
+        actor = delete_branch.await_args.args[0]
+        assert actor.user.id == setup_data["admin"].id
+        assert actor.agent.id == setup_data["agent"].id
         assert delete_branch.await_args.kwargs["branch_name"] == "br_old"
 
-    async def test_branch_tool_calls_allow_omitted_instance_id(self, client, auth_headers):
+    @pytest.mark.parametrize("pinned", [False, True])
+    async def test_workspace_branch_routes_to_selected_agent_only(
+        self, client, auth_headers, setup_data, pinned,
+    ):
+        user = setup_data["admin"]
+        default_agent = setup_data["agent"]
+        default_instance = setup_data["instance"]
+        async with engine_mod._session_factory() as session:
+            agent = Agent(name="pinned-agent", created_by=user.id)
+            instance = Instance(
+                cluster_id="pc-pinned", name="Pinned Instance",
+                topology=InstanceTopology.SINGLE_TENANT,
+                allocation_mode=AllocationMode.REGISTERED,
+                host="pinned.example.invalid", port=3306, status=InstanceStatus.ACTIVE,
+            )
+            session.add_all([agent, instance])
+            await session.flush()
+            credential = InstanceCredential(
+                instance_id=instance.id, name="pinned-credential",
+                purpose=CredentialPurpose.DIRECT_ACCESS,
+                capability=CredentialCapability.READWRITE,
+                username_ciphertext=encrypt("pinned-user"),
+                password_ciphertext=encrypt("pinned-password"),
+                created_by_user_id=user.id,
+            )
+            session.add(credential)
+            await session.flush()
+            binding = AgentInstanceBinding(
+                agent_id=agent.id, instance_id=instance.id, credential_id=credential.id,
+                permission=Permission.READWRITE, created_by_user_id=user.id,
+            )
+            binding.capabilities = [AgentInstanceBindingCapability(capability=capability)
+                for capability in (BindingCapability.SQL_READ, BindingCapability.SQL_WRITE)]
+            session.add_all([
+                binding,
+                AgentUserAssignment(agent_id=agent.id, user_id=user.id,
+                                    created_by_user_id=user.id, is_direct=True),
+                UserWorkspace(user_id=user.id, default_agent_id=default_agent.id),
+            ])
+            await session.commit()
+
+        selected_agent = agent if pinned else default_agent
+        selected_instance = instance if pinned else default_instance
+        forbidden_instance = default_instance if pinned else instance
+        if pinned:
+            token = _create_mcp_token(f"user:{user.id}", user.credential_epoch, agent.id)
+            auth_headers = {"Authorization": f"Bearer {token}"}
         session_id = await self._initialize(client, auth_headers)
         headers = {**MCP_HEADERS, **auth_headers}
         if session_id:
             headers["mcp-session-id"] = session_id
+        gateway = SimpleNamespace(execute=AsyncMock(return_value={
+            "columns": ["Branch"], "rows": [["feature"]], "row_count": 1, "truncated": False,
+        }))
+        with patch("server.mcp.tools.branch_handler.get_gateway", return_value=gateway):
+            for name in ("list_branches", "create_branch", "delete_branch"):
+                arguments = {} if name == "list_branches" else {"branch_name": "feature"}
+                for allowed, target in ((True, selected_instance), (False, forbidden_instance)):
+                    gateway.execute.reset_mock()
+                    response = await client.post(
+                        "/mcp", headers=headers,
+                        json=_jsonrpc("tools/call", {"name": name, "arguments": {
+                            **arguments, "instance_id": target.id,
+                        }}, req_id=8),
+                    )
+                    assert response.status_code == 200
+                    result = _parse_sse_response(response.text)[0]["result"]
+                    if not allowed:
+                        assert result["isError"] is True
+                        assert json.loads(result["content"][0]["text"])["error"] == "INSTANCE_NOT_ACCESSIBLE"
+                        gateway.execute.assert_not_awaited()
+                        continue
+                    assert not result.get("isError")
+                    assert gateway.execute.await_count == (2 if name == "delete_branch" else 1)
+                    for call in gateway.execute.await_args_list:
+                        assert call.kwargs["instance_id"] == selected_instance.id
+                        assert call.kwargs["host"] == selected_instance.host
+                        assert call.kwargs["user"] == ("pinned-user" if pinned else "pas_admin")
+                        assert call.kwargs["password"] == ("pinned-password" if pinned else "test_password")
+                        assert call.kwargs["user_id"] == f"workspace-user:{user.id}:agent:{selected_agent.id}"
 
-        async def call_tool(name: str, arguments: dict, req_id: int) -> dict:
-            resp = await client.post(
-                "/mcp",
-                json=_jsonrpc(
-                    "tools/call",
-                    {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                    req_id=req_id,
-                ),
-                headers=headers,
-            )
-            assert resp.status_code == 200
-            events = _parse_sse_response(resp.text)
-            result = events[0].get("result", {})
-            content = result.get("content", [])
-            assert len(content) > 0
-            return cast(dict, json.loads(content[0]["text"]))
-
-        list_result = {"content": [{"type": "text", "text": json.dumps({"branches": []})}]}
-        create_result = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(
-                        {
-                            "branch_name": "br_new",
-                            "status": "created",
-                        }
-                    ),
-                }
-            ]
-        }
-        delete_result = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(
-                        {
-                            "branch_name": "br_old",
-                            "status": "deleted",
-                        }
-                    ),
-                }
-            ]
-        }
-
-        with patch(
-            "server.mcp.transport.handle_list_branches", new_callable=AsyncMock, return_value=list_result
-        ) as list_branches:
-            payload = await call_tool("list_branches", {}, 6)
-        assert payload == {"branches": []}
-        assert list_branches.await_args.kwargs["instance_id"] is None
-
-        with patch("server.mcp.transport.handle_create_branch",
-                   new_callable=AsyncMock, return_value=create_result) as create_branch:
-            payload = await call_tool("create_branch", {"branch_name": "br_new"}, 7)
-        assert payload == {"branch_name": "br_new", "status": "created"}
-        assert create_branch.await_args.kwargs["instance_id"] is None
-        assert create_branch.await_args.kwargs["include_databases"] is None
-
-        with patch("server.mcp.transport.handle_delete_branch",
-                   new_callable=AsyncMock, return_value=delete_result) as delete_branch:
-            payload = await call_tool("delete_branch", {"branch_name": "br_old"}, 8)
-        assert payload == {"branch_name": "br_old", "status": "deleted"}
-        assert delete_branch.await_args.kwargs["instance_id"] is None
-
-    async def test_branch_tool_calls_allow_explicit_null_optional_args(self, client, auth_headers):
+    async def test_workspace_branch_never_falls_back_to_personal_grant(
+        self, client, auth_headers, setup_data,
+    ):
+        async with engine_mod._session_factory() as session:
+            binding = (await session.scalars(select(AgentInstanceBinding).where(
+                AgentInstanceBinding.agent_id == setup_data["agent"].id,
+            ))).one()
+            await session.delete(binding)
+            await session.commit()
         session_id = await self._initialize(client, auth_headers)
         headers = {**MCP_HEADERS, **auth_headers}
         if session_id:
             headers["mcp-session-id"] = session_id
+        with patch("server.mcp.tools.branch_handler.get_gateway") as gateway:
+            for name in ("list_branches", "create_branch", "delete_branch"):
+                arguments = {"instance_id": setup_data["instance"].id}
+                if name != "list_branches":
+                    arguments["branch_name"] = "feature"
+                resp = await client.post(
+                    "/mcp",
+                    json=_jsonrpc("tools/call", {"name": name, "arguments": arguments}, req_id=8),
+                    headers=headers,
+                )
+                result = _parse_sse_response(resp.text)[0]["result"]
+                assert result["isError"] is True
+                assert json.loads(result["content"][0]["text"])["error"] == "INSTANCE_NOT_ACCESSIBLE"
+            gateway.assert_not_called()
 
-        async def call_tool(name: str, arguments: dict, req_id: int) -> dict:
+    @pytest.mark.parametrize("explicit_null", [False, True])
+    async def test_workspace_branch_requires_instance(self, client, auth_headers, explicit_null):
+        session_id = await self._initialize(client, auth_headers)
+        headers = {**MCP_HEADERS, **auth_headers}
+        if session_id:
+            headers["mcp-session-id"] = session_id
+        for name in ("list_branches", "create_branch", "delete_branch"):
+            arguments = {} if name == "list_branches" else {"branch_name": "br_test"}
+            if explicit_null:
+                arguments["instance_id"] = None
             resp = await client.post(
                 "/mcp",
-                json=_jsonrpc(
-                    "tools/call",
-                    {
-                        "name": name,
-                        "arguments": arguments,
-                    },
-                    req_id=req_id,
-                ),
+                json=_jsonrpc("tools/call", {"name": name, "arguments": arguments}, req_id=6),
                 headers=headers,
             )
-            assert resp.status_code == 200
-            events = _parse_sse_response(resp.text)
-            result = events[0].get("result", {})
-            content = result.get("content", [])
-            assert len(content) > 0
-            return cast(dict, json.loads(content[0]["text"]))
-
-        list_result = {"content": [{"type": "text", "text": json.dumps({"branches": []})}]}
-        create_result = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(
-                        {
-                            "branch_name": "br_new",
-                            "status": "created",
-                        }
-                    ),
-                }
-            ]
-        }
-        delete_result = {
-            "content": [
-                {
-                    "type": "text",
-                    "text": json.dumps(
-                        {
-                            "branch_name": "br_old",
-                            "status": "deleted",
-                        }
-                    ),
-                }
-            ]
-        }
-
-        with patch(
-            "server.mcp.transport.handle_list_branches", new_callable=AsyncMock, return_value=list_result
-        ) as list_branches:
-            payload = await call_tool("list_branches", {"instance_id": None}, 6)
-        assert payload == {"branches": []}
-        assert list_branches.await_args.kwargs["instance_id"] is None
-
-        with patch("server.mcp.transport.handle_create_branch",
-                   new_callable=AsyncMock, return_value=create_result) as create_branch:
-            payload = await call_tool(
-                "create_branch",
-                {
-                    "branch_name": "br_new",
-                    "instance_id": None,
-                    "include_databases": None,
-                },
-                7,
-            )
-        assert payload == {"branch_name": "br_new", "status": "created"}
-        assert create_branch.await_args.kwargs["instance_id"] is None
-        assert create_branch.await_args.kwargs["include_databases"] is None
-
-        with patch("server.mcp.transport.handle_delete_branch",
-                   new_callable=AsyncMock, return_value=delete_result) as delete_branch:
-            payload = await call_tool(
-                "delete_branch",
-                {"branch_name": "br_old", "instance_id": None},
-                8,
-            )
-        assert payload == {"branch_name": "br_old", "status": "deleted"}
-        assert delete_branch.await_args.kwargs["instance_id"] is None
+            result = _parse_sse_response(resp.text)[0]["result"]
+            assert result["isError"] is True
+            assert json.loads(result["content"][0]["text"])["error"] == "INVALID_ARGUMENT"
 
     async def test_branch_tool_calls_reject_unsupported_arguments(self, client, auth_headers):
         session_id = await self._initialize(client, auth_headers)
@@ -1293,7 +1288,7 @@ class TestMCPTransportTools:
         result = events[0].get("result", {})
         assert result["isError"] is True
         payload = json.loads(result["content"][0]["text"])
-        assert payload["error"] == "INVALID_ARGUMENT"
+        assert payload["error"] == "BLOCKED_SQL"
 
     async def test_run_sql_without_branch_preserves_handler_error(
         self,

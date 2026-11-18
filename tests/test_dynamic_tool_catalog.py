@@ -71,12 +71,12 @@ AGENT_SQL_TOOLS = {
     "run_sql",
     "run_sql_transaction",
     "describe_schema",
-}
-USER_ONLY_TOOLS = {
-    "set_default_instance",
     "list_branches",
     "create_branch",
     "delete_branch",
+}
+USER_ONLY_TOOLS = {
+    "set_default_instance",
     "list_knowledge_resources",
     "kb_search",
     "kb_fetch_context",
@@ -145,6 +145,7 @@ async def _tools(client: AsyncClient, token: str) -> list[dict]:
     )
     assert response.status_code == 200
     event = _parse_sse(response.text)
+    assert "result" in event, event
     return event["result"]["tools"]
 
 
@@ -223,8 +224,10 @@ def clean(monkeypatch):
 
 
 @pytest.fixture
-async def catalog_setup():
-    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+async def catalog_setup(tmp_path):
+    # Concurrent requests need independent DB connections/savepoints, not the
+    # single shared connection used by SQLite in-memory StaticPool.
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'catalog.db'}")
     async with engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -655,7 +658,7 @@ async def test_direct_agent_and_resource_owner_get_distinct_catalogs(
         "sql",
         "instance_id",
     }
-    assert "branch" not in by_name["run_sql"]["inputSchema"]["properties"]
+    assert "branch" in by_name["run_sql"]["inputSchema"]["properties"]
     assert set(
         by_name["run_sql_transaction"]["inputSchema"]["required"]
     ) == {"sql_statements", "instance_id"}
@@ -777,7 +780,7 @@ async def test_agent_reuses_list_id_for_describe_and_sql_tools(
     assert gateway.schema_kwargs["instance_id"] == db_instance_id
 
 
-async def test_agent_sql_tools_require_instance_and_reject_branch(
+async def test_agent_sql_tools_require_instance_and_accept_branch(
     client,
     catalog_setup,
 ):
@@ -791,6 +794,8 @@ async def test_agent_sql_tools_require_instance_and_reject_branch(
         "INVALID_ARGUMENT"
     )
 
+    gateway = _AgentSQLGateway()
+    set_gateway(gateway)
     branch = await _call_tool(
         client,
         catalog_setup["direct_token"],
@@ -801,9 +806,8 @@ async def test_agent_sql_tools_require_instance_and_reject_branch(
             "branch": "feature",
         },
     )
-    assert json.loads(branch["content"][0]["text"])["error"] == (
-        "INVALID_ARGUMENT"
-    )
+    assert branch.get("isError") is not True
+    assert gateway.execute_kwargs["branch"] == "feature"
 
 
 async def test_concurrent_principals_do_not_leak_catalogs(

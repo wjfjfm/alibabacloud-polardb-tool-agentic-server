@@ -26,6 +26,7 @@ from server.mcp.tools import (
     resolve_target_instance,
 )
 from server.mcp.tools.agent_sql_access import resolve_agent_sql_access
+from server.mcp.tools.identifier import validate_identifier_minimal
 from server.mcp.tools.handlers import (
     SQLActor,
     _actor_audit_fields,
@@ -70,6 +71,7 @@ async def handle_describe_schema(
     *,
     instance_id: str | None = None,
     database: str | None = None,
+    branch: str | None = None,
     table_pattern: str | None = None,
     include_columns: bool = True,
     cursor: str | None = None,
@@ -82,6 +84,12 @@ async def handle_describe_schema(
 
     if isinstance(max_tables, bool) or not isinstance(max_tables, int) or max_tables < 1:
         return error_response("INVALID_ARGUMENT", "max_tables must be a positive integer.")
+
+    if branch is not None:
+        if branch:
+            valid = validate_identifier_minimal(branch, "branch")
+            if isinstance(valid, dict):
+                return valid
 
     if _is_agent_actor(user):
         credential_result = await resolve_agent_sql_access(
@@ -117,7 +125,9 @@ async def handle_describe_schema(
                 "INSTANCE_STARTING",
                 "Instance is starting, please retry in a few seconds.",
             )
-        credential_result = await _resolve_user_sql_credential(user, target_instance, session)
+        credential_result = await _resolve_user_sql_credential(
+            user, target_instance, session, allow_provisioning=branch is None,
+        )
         if isinstance(credential_result, dict):
             return credential_result
         binding = credential_result.binding
@@ -151,6 +161,11 @@ async def handle_describe_schema(
         tables_sql = _TABLES_SQL.format(pattern_clause="")
         tables_params = [db_name or "", effective_max + 1, offset]
 
+    if branch:
+        # Never qualify the logical database here: it can resolve to MAIN.
+        tables_sql = "SHOW TABLE STATUS" + (" LIKE %s" if table_pattern else "")
+        tables_params = [table_pattern] if table_pattern else []
+
     gateway = get_gateway()
 
     try:
@@ -164,6 +179,7 @@ async def handle_describe_schema(
             public_instance_id,
             tables_sql,
             tables_params,
+            branch=branch,
         )
     except SQLExecutionError as e:
         await log_audit(
@@ -181,6 +197,16 @@ async def handle_describe_schema(
         return error_response(e.code, e.message)
 
     rows = tables_result.get("rows", [])
+    if branch:
+        if tables_result.get("truncated"):
+            return error_response("RESULT_TOO_LARGE", "Branch table inventory was truncated; narrow table_pattern.")
+        names = [name.lower() for name in tables_result.get("columns", [])]
+        records = [dict(zip(names, row)) for row in rows]
+        rows = sorted(
+            [[r["name"], r.get("comment"), r.get("rows"), r.get("create_time")]
+             for r in records if r.get("engine") is not None],
+            key=lambda row: row[0],
+        )[offset:offset + effective_max + 1]
     # Request max+1 to detect has_more, then truncate.
     has_more = len(rows) > effective_max
     if has_more:
@@ -206,9 +232,14 @@ async def handle_describe_schema(
                     db_name,
                     _actor_cache_key(user),
                     public_instance_id,
-                    _COLUMNS_SQL,
-                    [db_name or "", table_name],
+                    ("SHOW FULL COLUMNS FROM `" + table_name.replace("`", "``").replace("%", "%%") + "`") if branch else _COLUMNS_SQL,
+                    [] if branch else [db_name or "", table_name],
+                    branch=branch,
                 )
+                if branch:
+                    names = [name.lower() for name in cols_result.get("columns", [])]
+                    records = [dict(zip(names, row)) for row in cols_result.get("rows", [])]
+                    cols_result = {"rows": [[r["field"], r["type"], r.get("comment")] for r in records]}
                 entry["columns"] = [
                     {"name": c[0], "type": c[1], "comment": c[2] or ""} for c in cols_result.get("rows", [])
                 ]
@@ -221,6 +252,8 @@ async def handle_describe_schema(
         "tables": tables,
         "has_more": has_more,
     }
+    if branch is not None:
+        result_data["branch"] = branch
     if has_more:
         result_data["next_cursor"] = encode_cursor(offset + effective_max)
 
@@ -248,6 +281,8 @@ async def _execute_parameterized(
     public_instance_id: str,
     sql: str,
     params: list,
+    *,
+    branch: str | None = None,
 ) -> dict:
     """Run trusted schema SQL through the gateway's sanitized public API."""
     return await gateway.execute_parameterized(
@@ -257,6 +292,7 @@ async def _execute_parameterized(
         password=password,
         sql=sql,
         params=params,
+        branch=branch,
         database=database,
         user_id=user_id,
         instance_id=public_instance_id,

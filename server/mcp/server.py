@@ -37,6 +37,7 @@ class RunSQLRequest(BaseModel):
 
 class RunSQLTransactionRequest(BaseModel):
     sql_statements: list[Annotated[str, Field(min_length=1)]] = Field(min_length=1)
+    branch: str | None = None
     instance_id: str | None = None
     database: str | None = None
     confirm: bool = False
@@ -47,6 +48,7 @@ class SetDefaultInstanceRequest(BaseModel):
 
 
 class DescribeSchemaRequest(BaseModel):
+    branch: str | None = None
     database: str | None = None
     instance_id: str | None = None
     table_pattern: str | None = None
@@ -120,6 +122,7 @@ async def run_sql_transaction(
     return await handle_run_sql_transaction(
         user, session,
         sql_statements=body.sql_statements,
+        branch=body.branch,
         instance_id=body.instance_id,
         database=body.database,
         confirm=body.confirm,
@@ -151,6 +154,7 @@ async def describe_schema(
         user, session,
         instance_id=body.instance_id,
         database=body.database,
+        branch=body.branch,
         table_pattern=body.table_pattern,
         include_columns=body.include_columns,
         cursor=body.cursor,
@@ -299,6 +303,7 @@ async def list_tools(_user: User = Depends(get_current_user)):
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "branch": _nullable_string_schema("Optional branch name to execute the transaction on."),
                         "sql_statements": {
                             "type": "array",
                             "items": {"type": "string", "minLength": 1},
@@ -416,6 +421,7 @@ async def list_tools(_user: User = Depends(get_current_user)):
                     "properties": {
                         "database": {"type": "string", "description": "Target database name. Defaults to resolved database."},
                         "instance_id": {"type": "string", "description": "Optional instance ID."},
+                        "branch": _nullable_string_schema("Optional branch name for schema discovery."),
                         "table_pattern": {"type": "string", "description": "Filter tables by name using SQL LIKE pattern (e.g. '%cars%')."},
                         "include_columns": {"type": "boolean", "description": "Include column details (default true).", "default": True},
                         "cursor": {"type": "string", "description": "Pagination cursor from previous response."},

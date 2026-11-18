@@ -27,6 +27,12 @@ def _sanitized_sql_error(error: Exception) -> SQLExecutionError:
             "No database is selected. Pass the database argument and retry.",
             "DATABASE_REQUIRED",
         )
+    if error_code == 2013:
+        return SQLExecutionError(
+            "Database connection was lost; the operation outcome may be unknown. "
+            "Verify the database state before retrying writes.",
+            "DB_CONNECTION_LOST",
+        )
     return SQLExecutionError("Database operation failed", "SQL_ERROR")
 
 
@@ -57,6 +63,14 @@ async def _exec_simple(conn, sql: str, params: tuple | None = None) -> None:
             await cur.execute(sql)
         else:
             await cur.execute(sql, params)
+
+
+async def _select_branch(conn, branch: str, database: str | None) -> None:
+    await _exec_simple(conn, "SET @@session.branch = %s", (branch,))
+    # PolarDB clears the selected database when switching branches. Select it
+    # afterwards, so unqualified SQL resolves inside the branch, not MAIN.
+    if database:
+        await _exec_simple(conn, "USE `" + database.replace("`", "``") + "`")
 
 
 def _sql_code_for_session_scan(sql: str) -> str:
@@ -191,6 +205,29 @@ def _changes_database_context(sql: str) -> bool:
     return False
 
 
+def _executes_dynamic_sql(sql: str) -> bool:
+    # Procedures and prepared SQL can mutate database/branch context indirectly.
+    try:
+        for statement in sqlparse.parse(_sql_code_for_session_scan(sql)):
+            for token in statement.flatten():
+                if token.is_whitespace or token.ttype in sql_tokens.Comment:
+                    continue
+                if token.normalized.upper() in {"PREPARE", "EXECUTE", "DEALLOCATE", "CALL"}:
+                    return True
+                break
+    except Exception:
+        return True  # Uncertain session state must not return to the pool.
+    return False
+
+
+def _taints_session_state(sql: str) -> bool:
+    return (
+        _changes_database_context(sql)
+        or _mentions_session_branch(sql)
+        or _executes_dynamic_sql(sql)
+    )
+
+
 class SQLGateway:
     def __init__(self, cache: ConnectionCache) -> None:
         self._cache = cache
@@ -229,7 +266,7 @@ class SQLGateway:
             user_id=user_id, instance_id=instance_id,
             host=host, port=port, user=user, password=password, database=database,
         )
-        discard = _changes_database_context(sql) or _mentions_session_branch(sql)
+        discard = _taints_session_state(sql)
         branch_set = False
         try:
             # Always set READ WRITE — read-only enforcement is done at the
@@ -239,7 +276,7 @@ class SQLGateway:
             # probe this variable to decide whether they can write.
             await _exec_simple(conn, "SET SESSION TRANSACTION READ WRITE")
             if branch is not None:
-                await _exec_simple(conn, "SET @@session.branch = %s", (branch,))
+                await _select_branch(conn, branch, database)
                 branch_set = True
             if is_select(sql):
                 await _exec_simple(conn, f"SET max_execution_time={config.sql_security.timeout_ms}")
@@ -268,7 +305,9 @@ class SQLGateway:
                     await _exec_simple(conn, "SET @@session.branch = ''")
                 except Exception:
                     discard = True
-            await self._cache.release(user_id, instance_id, conn, discard=discard)
+            # Resetting branch also clears the database; never cache stale
+            # ConnectionCache.database metadata after explicit branch selection.
+            await self._cache.release(user_id, instance_id, conn, discard=discard or branch is not None)
 
     async def execute_parameterized(
         self,
@@ -282,6 +321,7 @@ class SQLGateway:
         database: str | None,
         user_id: str,
         instance_id: str,
+        branch: str | None = None,
     ) -> dict:
         """Execute trusted server SQL with separately bound parameters."""
         if not isinstance(params, (list, tuple)):
@@ -299,20 +339,25 @@ class SQLGateway:
             password=password,
             database=database,
         )
-        discard = False
+        discard = branch is not None
         try:
             async def _run() -> dict:
+                if branch is not None:
+                    await _select_branch(conn, branch, database)
                 async with conn.cursor() as cur:
                     await cur.execute(sql, params)
                     columns = (
                         [desc[0] for desc in cur.description]
                         if cur.description else []
                     )
-                    rows = await cur.fetchall()
-                    return {
+                    rows = await cur.fetchmany(10001) if branch else await cur.fetchall()
+                    result = {
                         "columns": columns,
-                        "rows": _json_safe_rows([list(row) for row in rows]),
+                        "rows": _json_safe_rows([list(row) for row in (rows[:10000] if branch else rows)]),
                     }
+                    if branch:
+                        result["truncated"] = len(rows) > 10000
+                    return result
 
             return await asyncio.wait_for(
                 _run(),
@@ -349,15 +394,17 @@ class SQLGateway:
         user_id: str,
         instance_id: str,
         read_only: bool = False,
+        branch: str | None = None,
     ) -> list[dict]:
         config = get_config()
         conn = await self._acquire(
             user_id=user_id, instance_id=instance_id,
             host=host, port=port, user=user, password=password, database=database,
         )
-        session_state_touched = any(
-            _changes_database_context(stmt) or _mentions_session_branch(stmt)
-            for stmt in sql_statements
+        # Discard explicit branch sessions even after a successful rollback: the
+        # server may retain branch-local state beyond the session variable.
+        session_state_touched = branch is not None or any(
+            _taints_session_state(stmt) for stmt in sql_statements
         )
         discard = session_state_touched
         try:
@@ -371,6 +418,8 @@ class SQLGateway:
             )
 
             async def _run_transaction() -> list[dict]:
+                if branch is not None:
+                    await _select_branch(conn, branch, database)
                 await _exec_simple(conn, "BEGIN")
                 results = []
                 for stmt in sql_statements:

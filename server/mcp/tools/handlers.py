@@ -19,7 +19,7 @@ from server.core.binding_manager import (
 from server.core.crypto import decrypt
 from server.core.ddl_hints import DDL_COMMENT_HINT, should_add_comment_hint
 from server.core.responses import error_response
-from server.core.sql_gateway import _mentions_session_branch
+from server.core.sql_gateway import _executes_dynamic_sql, _mentions_session_branch
 from server.core.sql_executor import (
     RateLimitError,
     SQLExecutionError,
@@ -127,6 +127,8 @@ async def _resolve_user_sql_credential(
     user: User,
     target_instance: Instance,
     session: AsyncSession,
+    *,
+    allow_provisioning: bool = True,
 ):
     try:
         access = await resolve_user_instance_access(session, user.id, target_instance.id)
@@ -163,6 +165,8 @@ async def _resolve_user_sql_credential(
             message="Database credential resolution failed.",
         )
     if resolved is None:
+        if not allow_provisioning:
+            return error_response("CONNECTION_ERROR", "An existing database credential is required for branch access.")
         if target_instance.topology == InstanceTopology.MULTITENANT:
             from server.core.tenant_provisioner import ensure_tenant
 
@@ -364,19 +368,12 @@ async def handle_run_sql(
             "run_sql accepts exactly one SQL statement. Use run_sql_transaction for multiple statements.",
         )
 
-    if _is_agent_actor(user) and branch is not None:
-        return error_response(
-            "INVALID_ARGUMENT",
-            "branch is not supported for Agent SQL access. Omit branch and "
-            "pass an instance_id returned by list_db_instances.",
-        )
-
     if branch is not None:
         valid_branch = validate_identifier_minimal(branch, "branch")
         if isinstance(valid_branch, dict):
             return valid_branch
         branch = valid_branch
-        if _mentions_session_branch(sql):
+        if _mentions_session_branch(sql) or _executes_dynamic_sql(sql):
             await log_audit(
                 session,
                 action="run_sql",
@@ -387,7 +384,7 @@ async def handle_run_sql(
             )
             return error_response(
                 "BLOCKED_SQL",
-                "SQL must not reference @@session.branch when branch is provided.",
+                "SQL must not change branch context directly or through dynamic SQL when branch is provided.",
             )
 
     # Rate limit check
@@ -473,7 +470,9 @@ async def handle_run_sql(
                 "INSTANCE_STARTING",
                 "Instance is starting, please retry in a few seconds.",
             )
-        credential_result = await _resolve_user_sql_credential(user, target_instance, session)
+        credential_result = await _resolve_user_sql_credential(
+            user, target_instance, session, allow_provisioning=branch is None,
+        )
         if isinstance(credential_result, dict):
             return credential_result
         binding = credential_result.binding
@@ -625,6 +624,7 @@ async def handle_run_sql_transaction(
     sql_statements: list[str],
     instance_id: str | None = None,
     database: str | None = None,
+    branch: str | None = None,
     confirm: bool = False,
     session_factory=None,
     background_tasks=None,
@@ -634,6 +634,16 @@ async def handle_run_sql_transaction(
 
     if not _is_agent_actor(user) and user.status == UserStatus.DISABLED:
         return error_response("USER_DISABLED", "Your account has been disabled. Contact admin.")
+
+    if branch is not None:
+        valid_branch = validate_identifier_minimal(branch, "branch")
+        if isinstance(valid_branch, dict):
+            return valid_branch
+        branch = valid_branch
+        if any(_mentions_session_branch(stmt) for stmt in sql_statements):
+            return error_response("BLOCKED_SQL", "SQL must not reference @@session.branch when branch is provided.")
+        if any(_executes_dynamic_sql(stmt) for stmt in sql_statements):
+            return error_response("BLOCKED_SQL", "Dynamic SQL is not allowed in a branch transaction.")
 
     if not sql_statements:
         return error_response(
@@ -693,9 +703,10 @@ async def handle_run_sql_transaction(
                     "type": "text",
                     "text": (
                         "⚠️ DESTRUCTIVE OPERATION DETECTED\n\n"
-                        "The following statements require confirmation:\n"
+                        + (f"Branch: {branch}\n" if branch is not None else "")
+                        + "The following statements require confirmation:\n"
                         + "\n".join(lines)
-                        + "\n\nTo proceed, call run_sql_transaction again with confirm=true."
+                        + "\n\nTo proceed, call run_sql_transaction again with the same statements, same branch, and confirm=true."
                     ),
                 }
             ],
@@ -736,7 +747,9 @@ async def handle_run_sql_transaction(
                 "INSTANCE_STARTING",
                 "Instance is starting, please retry in a few seconds.",
             )
-        credential_result = await _resolve_user_sql_credential(user, target_instance, session)
+        credential_result = await _resolve_user_sql_credential(
+            user, target_instance, session, allow_provisioning=branch is None,
+        )
         if isinstance(credential_result, dict):
             return credential_result
         binding = credential_result.binding
@@ -795,6 +808,7 @@ async def handle_run_sql_transaction(
             user=username,
             password=password,
             sql_statements=sql_statements,
+            branch=branch,
             database=db_name,
             user_id=_actor_cache_key(user),
             instance_id=public_instance_id,
@@ -835,6 +849,8 @@ async def handle_run_sql_transaction(
 
     duration_ms = int((time.time() - start_time) * 1000)
     result_data = {"results": results, "statement_count": len(results)}
+    if branch is not None:
+        result_data["branch"] = branch
     is_mt_user = (
         not _is_agent_actor(user)
         and target_instance.topology == InstanceTopology.MULTITENANT

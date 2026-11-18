@@ -236,6 +236,142 @@ async def _provisioned_agent(
     return agent, instance, resource, credential
 
 
+@pytest.mark.parametrize("workspace", [False, True])
+@pytest.mark.parametrize("provisioned", [False, True])
+async def test_branch_mutation_uses_sql_actor_credentials_and_audit(session, gateway, workspace, provisioned):
+    from server.mcp.tools.branch_handler import handle_create_branch
+
+    if provisioned:
+        agent, instance, resource, _ = await _provisioned_agent(session)
+        public_id, db_user = resource.id, "resource-user"
+    else:
+        agent, instance, _, _ = await _bound_agent(session,
+            permission=Permission.READWRITE, credential_capability=CredentialCapability.READWRITE)
+        public_id, db_user = instance.id, "agent-user"
+    actor = WorkspaceSQLActor(user=agent.creator, agent=agent) if workspace else agent
+    result = await handle_create_branch(actor, session, instance_id=public_id, branch_name="feature")
+    assert not result.get("isError")
+    assert gateway.execute_kwargs["user"] == db_user
+    assert gateway.execute_kwargs["instance_id"] == public_id
+    assert gateway.execute_kwargs["branch"] == ""
+    assert gateway.execute_kwargs["database"] is None
+    assert gateway.execute_kwargs["user_id"] == (
+        f"workspace-user:{agent.creator.id}:agent:{agent.id}" if workspace else f"agent:{agent.id}")
+    audit = (await session.scalars(select(AuditLog).where(AuditLog.action == "create_branch"))).one()
+    assert audit.instance_id == instance.id
+    assert audit.target_id == public_id
+    assert audit.target_type == ("db_instance_resource" if provisioned else "instance")
+    assert audit.actor_user_id == (agent.creator.id if workspace else None)
+    assert audit.actor_agent_id == (None if workspace else agent.id)
+
+
+@pytest.mark.parametrize("workspace", [False, True])
+@pytest.mark.parametrize("action", ["list", "delete"])
+async def test_branch_inventory_and_delete_use_agent_credential(session, gateway, workspace, action):
+    from unittest.mock import AsyncMock
+    from server.mcp.tools.branch_handler import handle_list_branches, handle_delete_branch
+
+    agent, instance, _, _ = await _bound_agent(session,
+        permission=Permission.READONLY if action == "list" else Permission.READWRITE,
+        credential_capability=CredentialCapability.READONLY if action == "list" else CredentialCapability.READWRITE)
+    actor = WorkspaceSQLActor(user=agent.creator, agent=agent) if workspace else agent
+    gateway.execute = AsyncMock(return_value={
+        "columns": ["Branch"], "rows": [["feature"]], "row_count": 1, "truncated": False,
+    })
+    if action == "list":
+        result = await handle_list_branches(actor, session, instance_id=instance.id)
+        assert json.loads(result["content"][0]["text"])["branches"] == [{"branch_name": "feature"}]
+    else:
+        result = await handle_delete_branch(actor, session, instance_id=instance.id, branch_name="feature")
+        assert json.loads(result["content"][0]["text"])["status"] == "deleted"
+    calls = gateway.execute.await_args_list
+    assert calls[0].kwargs["sql"] == "SHOW BRANCHES"
+    assert len(calls) == (1 if action == "list" else 2)
+    for call in calls:
+        assert call.kwargs["user"] == "agent-user"
+        assert call.kwargs["instance_id"] == instance.id
+        assert call.kwargs["branch"] == ""
+
+
+@pytest.mark.parametrize("action", ["list", "create", "delete"])
+async def test_branch_execution_and_audit_use_resolved_identity(session, gateway, action):
+    from unittest.mock import AsyncMock, patch
+    from server.mcp.tools.agent_sql_access import AgentSQLAccess
+    from server.mcp.tools.branch_handler import (
+        handle_list_branches, handle_create_branch, handle_delete_branch,
+    )
+
+    agent, instance, credential, _ = await _bound_agent(session,
+        permission=Permission.READWRITE, credential_capability=CredentialCapability.READWRITE)
+    access = AgentSQLAccess(
+        agent=agent, public_instance_id="resolved-resource", source="provisioned",
+        instance=instance, credential=credential, permission=Permission.READWRITE,
+        database="application",
+    )
+    gateway.execute = AsyncMock(return_value={
+        "columns": ["Branch"], "rows": [["feature"]], "row_count": 1, "truncated": False,
+    })
+    handlers = {"list": handle_list_branches, "create": handle_create_branch, "delete": handle_delete_branch}
+    arguments = {} if action == "list" else {"branch_name": "feature"}
+    with patch("server.mcp.tools.branch_handler.resolve_agent_sql_access",
+               new=AsyncMock(return_value=access)):
+        result = await handlers[action](agent, session, instance_id="requested-alias", **arguments)
+    assert not result.get("isError")
+    for call in gateway.execute.await_args_list:
+        assert call.kwargs["instance_id"] == access.public_instance_id
+    audit = (await session.scalars(select(AuditLog))).one()
+    assert audit.instance_id == instance.id
+    assert audit.target_id == access.public_instance_id
+    assert audit.target_type == "db_instance_resource"
+
+
+@pytest.mark.parametrize("workspace", [False, True])
+@pytest.mark.parametrize("action", ["create", "delete"])
+async def test_readonly_branch_mutations_are_blocked(session, gateway, workspace, action):
+    from server.mcp.tools.branch_handler import handle_create_branch, handle_delete_branch
+
+    agent, instance, _, _ = await _bound_agent(session)
+    actor = WorkspaceSQLActor(user=agent.creator, agent=agent) if workspace else agent
+    handler = handle_create_branch if action == "create" else handle_delete_branch
+    result = await handler(actor, session, instance_id=instance.id, branch_name="feature")
+    assert _error_code(result) == "READ_ONLY_ACCESS"
+    assert gateway.execute_kwargs is None
+
+
+@pytest.mark.parametrize("workspace", [False, True])
+async def test_branch_cannot_fall_back_to_user_or_backend_credentials(session, gateway, workspace):
+    from server.mcp.tools.branch_handler import handle_create_branch
+
+    agent, instance, _, _ = await _bound_agent(session, enabled=False)
+    actor = WorkspaceSQLActor(user=agent.creator, agent=agent) if workspace else agent
+    result = await handle_create_branch(actor, session, instance_id=instance.id, branch_name="feature")
+    assert _error_code(result) == "INSTANCE_NOT_ACCESSIBLE"
+    assert gateway.execute_kwargs is None
+
+
+@pytest.mark.parametrize("workspace", [False, True])
+async def test_branch_transaction_and_schema_use_sql_actor(session, gateway, workspace):
+    from unittest.mock import AsyncMock
+
+    agent, instance, _, _ = await _bound_agent(session)
+    actor = WorkspaceSQLActor(user=agent.creator, agent=agent) if workspace else agent
+    result = await handle_run_sql_transaction(actor, session, instance_id=instance.id,
+        sql_statements=["SELECT 1"], branch="feature")
+    assert not result.get("isError")
+    assert gateway.transaction_kwargs["branch"] == "feature"
+    gateway.execute_parameterized = AsyncMock(return_value={
+        "columns": ["Name", "Engine", "Comment", "Rows", "Create_time"],
+        "rows": [["orders", "InnoDB", "", 1, None]],
+    })
+    result = await handle_describe_schema(actor, session, instance_id=instance.id,
+        branch="feature", include_columns=False)
+    assert not result.get("isError")
+    call = gateway.execute_parameterized.await_args.kwargs
+    assert call["branch"] == "feature"
+    assert call["user"] == "agent-user"
+    assert call["sql"] == "SHOW TABLE STATUS"
+
+
 def _error_code(result: dict) -> str:
     assert result["isError"] is True
     return json.loads(result["content"][0]["text"])["error"]
@@ -544,7 +680,7 @@ async def test_readonly_agent_run_sql_rejects_write(session, gateway):
     assert gateway.execute_kwargs is None
 
 
-async def test_agent_run_sql_rejects_branch(session, gateway):
+async def test_agent_run_sql_selects_branch(session, gateway):
     agent, instance, _, _ = await _bound_agent(session)
 
     result = await handle_run_sql(
@@ -555,8 +691,9 @@ async def test_agent_run_sql_rejects_branch(session, gateway):
         branch="feature",
     )
 
-    assert _error_code(result) == "INVALID_ARGUMENT"
-    assert gateway.execute_kwargs is None
+    assert not result.get("isError")
+    assert gateway.execute_kwargs["branch"] == "feature"
+    assert gateway.execute_kwargs["user"] == "agent-user"
 
 
 async def test_readonly_agent_transaction_executes_read_statements(

@@ -67,16 +67,10 @@ DB_INSTANCE_TOOL_NAMES = frozenset(
         "delete_db_instance",
     }
 )
-WORKSPACE_UNSUPPORTED_TOOL_NAMES = frozenset(
-    {
-        "set_default_instance",
-        "list_branches",
-        "create_branch",
-        "delete_branch",
-    }
-)
-PERSONAL_UNSUPPORTED_TOOL_NAMES = WORKSPACE_UNSUPPORTED_TOOL_NAMES | frozenset({
-    "create_db_instance", "delete_db_instance", "doc_delete", "doc_rechunk",
+WORKSPACE_UNSUPPORTED_TOOL_NAMES = frozenset({"set_default_instance"})
+BRANCH_TOOL_NAMES = frozenset({"list_branches", "create_branch", "delete_branch"})
+PERSONAL_UNSUPPORTED_TOOL_NAMES = frozenset({
+    "set_default_instance", "create_db_instance", "delete_db_instance", "doc_delete", "doc_rechunk",
 })
 AGENT_SQL_TOOL_NAMES = frozenset(
     {
@@ -85,6 +79,9 @@ AGENT_SQL_TOOL_NAMES = frozenset(
         "describe_schema",
     }
 )
+
+
+SQL_TOOL_NAMES = AGENT_SQL_TOOL_NAMES | BRANCH_TOOL_NAMES
 
 
 def _is_agent_user_token(access_token: Any) -> bool:
@@ -131,7 +128,7 @@ async def _direct_management_tools(
     for access in accesses:
         if personal and access is not None:
             if access.permission is not None and BindingCapability.SQL_READ in access.capabilities:
-                allowed.update({"list_db_instances", "describe_db_instance", *AGENT_SQL_TOOL_NAMES})
+                allowed.update({"list_db_instances", "describe_db_instance", *SQL_TOOL_NAMES})
             if BindingCapability.DB_INSTANCE_LIST in access.capabilities:
                 allowed.add("list_db_instances")
             if BindingCapability.DB_INSTANCE_DESCRIBE in access.capabilities:
@@ -162,7 +159,7 @@ async def _direct_management_tools(
             access.permission is not None
             and BindingCapability.SQL_READ in access.capabilities
         ):
-            allowed.update(AGENT_SQL_TOOL_NAMES)
+            allowed.update(SQL_TOOL_NAMES)
     return allowed
 
 
@@ -247,7 +244,7 @@ async def allowed_db_instance_tool_names(
         "run_sql_read" in resource_capabilities(resource)
         for resource in owned_resources
     ):
-        allowed.update(AGENT_SQL_TOOL_NAMES)
+        allowed.update(SQL_TOOL_NAMES)
 
     if await has_eligible_provisioning_backend(session, principal.id):
         allowed.update(DB_INSTANCE_TOOL_NAMES)
@@ -333,7 +330,6 @@ class AuthorizedFastMCP(FastMCP):
                 and (
                     resource is None
                     or resource.kind == PrincipalKind.AGENT
-                    or is_personal_access(access_token)
                 )
                 and tool.name in WORKSPACE_UNSUPPORTED_TOOL_NAMES
             )
@@ -342,7 +338,7 @@ class AuthorizedFastMCP(FastMCP):
                 and authenticated.kind == PrincipalKind.USER
                 and resource is None
                 and tool.name
-                in AGENT_SQL_TOOL_NAMES | POLARRAG_TOOL_NAMES
+                in SQL_TOOL_NAMES | POLARRAG_TOOL_NAMES
             )
             and not (
                 authenticated is not None
@@ -352,7 +348,7 @@ class AuthorizedFastMCP(FastMCP):
             and not (
                 resource is not None
                 and (resource.kind == PrincipalKind.AGENT or is_personal_access(access_token))
-                and tool.name in AGENT_SQL_TOOL_NAMES
+                and tool.name in SQL_TOOL_NAMES
                 and tool.name not in allowed
             )
         ]
@@ -363,16 +359,13 @@ class AuthorizedFastMCP(FastMCP):
             return visible
         rewritten: list[MCPTool] = []
         for tool in visible:
-            if tool.name not in AGENT_SQL_TOOL_NAMES:
+            if tool.name not in SQL_TOOL_NAMES:
                 rewritten.append(tool)
                 continue
             schema = copy.deepcopy(tool.inputSchema)
             properties = schema.get("properties", {})
             required = set(schema.get("required", []))
             required.add("instance_id")
-            if tool.name == "run_sql":
-                properties.pop("branch", None)
-                required.discard("branch")
             schema["required"] = [
                 name for name in properties if name in required
             ]
@@ -400,10 +393,8 @@ class AuthorizedFastMCP(FastMCP):
         if is_personal_access(access_token):
             if name in PERSONAL_UNSUPPORTED_TOOL_NAMES:
                 raise ToolError(f"Unknown tool: {name}")
-            if name in AGENT_SQL_TOOL_NAMES and not arguments.get("instance_id"):
+            if name in SQL_TOOL_NAMES and not arguments.get("instance_id"):
                 raise ToolError("Personal SQL access requires instance_id")
-            if name == "run_sql" and arguments.get("branch") is not None:
-                raise ToolError("Branch access is unavailable on personal MCP")
         from server.features.knowledge import runtime, KnowledgeUnavailable
         feature = runtime()
         if name in POLARRAG_TOOL_NAMES and feature is not None:

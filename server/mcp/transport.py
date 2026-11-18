@@ -205,6 +205,24 @@ def _log_user_tool_completion(
     )
 
 
+def _log_workspace_tool_completion(
+    *, tool: str, workspace: MCPWorkspaceContext, started_at: float,
+    result: dict[str, Any], instance_id: str | None, **safe_fields: Any,
+) -> None:
+    logger.info(
+        f"tool.{tool}.completed",
+        extra={
+            "actor_kind": workspace.authenticated_principal.kind.value,
+            "actor_id": workspace.authenticated_principal.id,
+            "resource_agent_id": workspace.agent.id if workspace.agent else None,
+            "instance_id": instance_id,
+            "duration_ms": int((time.perf_counter() - started_at) * 1000),
+            **_safe_tool_result_metadata(result),
+            **safe_fields,
+        },
+    )
+
+
 def _forbid_extra_tool_arguments(
     mcp: AuthorizedFastMCP, tool_names: set[str]
 ) -> None:
@@ -373,23 +391,9 @@ def _build_mcp_server() -> AuthorizedFastMCP:
                 session_factory=factory, background_tasks=_background_tasks,
             )
             response: Any = _handler_result(result)
-            safe_metadata = _safe_tool_result_metadata(result)
-            logger.info(
-                "tool.run_sql.completed",
-                extra={
-                    "actor_kind": (
-                        workspace.authenticated_principal.kind.value
-                    ),
-                    "actor_id": workspace.authenticated_principal.id,
-                    "resource_agent_id": workspace.agent.id if workspace.agent else None,
-                    "instance_id": instance_id,
-                    "statement_count": 1,
-                    "confirm": confirm,
-                    "duration_ms": int(
-                        (time.perf_counter() - started_at) * 1000
-                    ),
-                    **safe_metadata,
-                },
+            _log_workspace_tool_completion(
+                tool="run_sql", workspace=workspace, started_at=started_at,
+                result=result, instance_id=instance_id, statement_count=1, confirm=confirm,
             )
             return response
 
@@ -409,19 +413,25 @@ def _build_mcp_server() -> AuthorizedFastMCP:
 
         factory = get_session_factory()
         async with factory() as session:
-            user = await _get_current_user(session, access_token.subject)
-            if user is None:
-                return _json_error_result("AUTH_REQUIRED", "User not found or disabled.")
+            try:
+                workspace = await resolve_mcp_workspace_context(
+                    session, access_token.subject, access_token_agent_id(access_token),
+                    personal=is_personal_access(access_token),
+                )
+            except MCPWorkspaceUnavailable as exc:
+                return _workspace_error_result(exc)
+            except PrincipalAuthenticationError:
+                return _json_error_result("AUTH_REQUIRED", "Principal not found or disabled.")
 
             started_at = time.perf_counter()
             result = await handle_list_branches(
-                user, session, instance_id=instance_id,
+                workspace.sql_actor, session, instance_id=instance_id,
                 session_factory=factory, background_tasks=_background_tasks,
             )
             response = _handler_result(result)
-            _log_user_tool_completion(
+            _log_workspace_tool_completion(
                 tool="list_branches",
-                user=user,
+                workspace=workspace,
                 started_at=started_at,
                 result=result,
                 instance_id=instance_id,
@@ -448,20 +458,26 @@ def _build_mcp_server() -> AuthorizedFastMCP:
 
         factory = get_session_factory()
         async with factory() as session:
-            user = await _get_current_user(session, access_token.subject)
-            if user is None:
-                return _json_error_result("AUTH_REQUIRED", "User not found or disabled.")
+            try:
+                workspace = await resolve_mcp_workspace_context(
+                    session, access_token.subject, access_token_agent_id(access_token),
+                    personal=is_personal_access(access_token),
+                )
+            except MCPWorkspaceUnavailable as exc:
+                return _workspace_error_result(exc)
+            except PrincipalAuthenticationError:
+                return _json_error_result("AUTH_REQUIRED", "Principal not found or disabled.")
 
             started_at = time.perf_counter()
             result = await handle_create_branch(
-                user, session, branch_name=branch_name,
+                workspace.sql_actor, session, branch_name=branch_name,
                 include_databases=include_databases, instance_id=instance_id,
                 session_factory=factory, background_tasks=_background_tasks,
             )
             response = _handler_result(result)
-            _log_user_tool_completion(
+            _log_workspace_tool_completion(
                 tool="create_branch",
-                user=user,
+                workspace=workspace,
                 started_at=started_at,
                 result=result,
                 instance_id=instance_id,
@@ -489,19 +505,25 @@ def _build_mcp_server() -> AuthorizedFastMCP:
 
         factory = get_session_factory()
         async with factory() as session:
-            user = await _get_current_user(session, access_token.subject)
-            if user is None:
-                return _json_error_result("AUTH_REQUIRED", "User not found or disabled.")
+            try:
+                workspace = await resolve_mcp_workspace_context(
+                    session, access_token.subject, access_token_agent_id(access_token),
+                    personal=is_personal_access(access_token),
+                )
+            except MCPWorkspaceUnavailable as exc:
+                return _workspace_error_result(exc)
+            except PrincipalAuthenticationError:
+                return _json_error_result("AUTH_REQUIRED", "Principal not found or disabled.")
 
             started_at = time.perf_counter()
             result = await handle_delete_branch(
-                user, session, branch_name=branch_name, instance_id=instance_id,
+                workspace.sql_actor, session, branch_name=branch_name, instance_id=instance_id,
                 session_factory=factory, background_tasks=_background_tasks,
             )
             response = _handler_result(result)
-            _log_user_tool_completion(
+            _log_workspace_tool_completion(
                 tool="delete_branch",
-                user=user,
+                workspace=workspace,
                 started_at=started_at,
                 result=result,
                 instance_id=instance_id,
@@ -558,6 +580,7 @@ def _build_mcp_server() -> AuthorizedFastMCP:
         sql_statements: list[str],
         instance_id: str | None = None,
         database: str | None = None,
+        branch: str | None = None,
         confirm: bool = False,
     ) -> Any:
         access_token = get_access_token()
@@ -583,27 +606,14 @@ def _build_mcp_server() -> AuthorizedFastMCP:
             result = await handle_run_sql_transaction(
                 actor, session,
                 sql_statements=sql_statements,
+                branch=branch,
                 instance_id=instance_id, database=database, confirm=confirm,
                 session_factory=factory, background_tasks=_background_tasks,
             )
             response = _handler_result(result)
-            safe_metadata = _safe_tool_result_metadata(result)
-            logger.info(
-                "tool.run_sql_transaction.completed",
-                extra={
-                    "actor_kind": (
-                        workspace.authenticated_principal.kind.value
-                    ),
-                    "actor_id": workspace.authenticated_principal.id,
-                    "resource_agent_id": workspace.agent.id if workspace.agent else None,
-                    "instance_id": instance_id,
-                    "statement_count": len(sql_statements),
-                    "confirm": confirm,
-                    "duration_ms": int(
-                        (time.perf_counter() - started_at) * 1000
-                    ),
-                    **safe_metadata,
-                },
+            _log_workspace_tool_completion(
+                tool="run_sql_transaction", workspace=workspace, started_at=started_at,
+                result=result, instance_id=instance_id, statement_count=len(sql_statements), confirm=confirm,
             )
             return response
 
@@ -620,6 +630,7 @@ def _build_mcp_server() -> AuthorizedFastMCP:
         ),
     )
     async def describe_schema(
+        branch: str | None = None,
         database: str | None = None,
         instance_id: str | None = None,
         table_pattern: str | None = None,
@@ -650,6 +661,7 @@ def _build_mcp_server() -> AuthorizedFastMCP:
             result = await handle_describe_schema(
                 actor, session,
                 instance_id=instance_id, database=database,
+                branch=branch,
                 table_pattern=table_pattern, include_columns=include_columns,
                 cursor=cursor, max_tables=max_tables,
                 session_factory=factory, background_tasks=_background_tasks,
@@ -658,22 +670,10 @@ def _build_mcp_server() -> AuthorizedFastMCP:
                 response = str(result["content"][0].get("text", json.dumps(result)))
             else:
                 response = json.dumps(result)
-            logger.info(
-                "tool.describe_schema.completed",
-                extra={
-                    "actor_kind": (
-                        workspace.authenticated_principal.kind.value
-                    ),
-                    "actor_id": workspace.authenticated_principal.id,
-                    "resource_agent_id": workspace.agent.id if workspace.agent else None,
-                    "instance_id": instance_id,
-                    "duration_ms": int(
-                        (time.perf_counter() - started_at) * 1000
-                    ),
-                    **_safe_tool_result_metadata(result),
-                    "include_columns": include_columns,
-                    "max_tables": max_tables,
-                },
+            _log_workspace_tool_completion(
+                tool="describe_schema", workspace=workspace, started_at=started_at,
+                result=result, instance_id=instance_id,
+                include_columns=include_columns, max_tables=max_tables,
             )
             return response
 

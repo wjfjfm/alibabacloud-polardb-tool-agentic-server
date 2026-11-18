@@ -64,7 +64,15 @@ Token。个人 Token 不能用于控制台 REST 请求，也不能作为 Refresh
 仅有 SQL 权限（包括继承权限）也允许发现和描述
 资源，但不会显示数据库密码。个人客户端不能创建或删除服务账号拥有的数据库，也不能选择服务账号。
 
-SQL 工具需要显式 `instance_id`；个人 MCP 不开放分支或默认实例操作。未配置外部地址时，控制台使用当前浏览器 origin 构造 Token 连接地址，并提示 OAuth 不可用，需管理员配置 `runtime_policy.external_base_url`。外部地址变更后，请吊销并重新生成个人 Token。
+SQL 和分支工具需要显式 `instance_id`。当前资源上下文具备 SQL 访问权限时，个人 MCP、Agent Workspace 和 Agent 直接访问均展示 `list_branches`、`create_branch` 和 `delete_branch`，并允许在 `run_sql`、`run_sql_transaction` 和 `describe_schema` 中指定 `branch`。个人访问使用用户授权；Workspace 和 Agent 直接访问使用 Agent 授权及凭据，不会回退到个人凭据。请使用 `list_db_instances` 返回的 `instance_id`，包括托管创建实例的公开资源 ID。
+
+分支 schema 查询使用所选分支的表和列元数据，而不是 MAIN 的 `INFORMATION_SCHEMA`。如果分支清单超过 10,000 张表，请缩小 `table_pattern` 范围；PAS 会拒绝不完整清单，而不是返回误导性的分页结果。显式选择分支时，会在切换后重新选择数据库，并在结束后丢弃连接以防止会话状态泄漏。显式指定分支的 SQL 调用和事务拒绝可能间接切换分支的动态 SQL（`PREPARE`、`EXECUTE`、`DEALLOCATE`、`CALL`）。事务在开始前选择分支；破坏性操作确认必须保持相同的语句和分支。
+
+目标实例必须支持分支；PAS 不会自动开启数据库功能或配置分支权限。实例授权及数据库权限仍然生效。只读授权允许列出分支，但创建和删除操作会在连接数据库前被拒绝。删除不存在的分支仅在完整清单检查后返回 `status: not_found`；清单不完整时拒绝操作。分支变更期间的 `TIMEOUT` 转为 `OPERATION_STATUS_UNKNOWN`；出现 `DB_CONNECTION_LOST` 时同样必须先验证结果，再重试写操作。
+
+分支控制和显式分支选择要求已有凭据；缺失时直接报错，不创建账号、租户或绑定。分支控制是实例级操作，不构成新的安全边界。执行与审计使用解析后的资源身份。在资源解析前被限流拒绝的请求仅记录请求的 ID，不记录已解析的目标类型。Workspace 解析保留普通 SQL 的既有生命周期行为（包括默认 Agent 选择或初始化），审计记录仍然启用。无需元数据 schema 迁移；镜像回退不会撤销已执行的 SQL、分支变更、审计记录或既有 Workspace 生命周期写入。
+
+个人 MCP 不开放默认实例操作。未配置外部地址时，控制台使用当前浏览器 origin 构造 Token 连接地址，并提示 OAuth 不可用，需管理员配置 `runtime_policy.external_base_url`。外部地址变更后，请吊销并重新生成个人 Token。
 
 ## 知识库访问
 

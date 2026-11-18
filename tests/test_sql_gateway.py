@@ -438,7 +438,7 @@ class TestExecute:
         cursor.execute.assert_any_await("SET @@session.branch = %s", ("",))
         cursor.execute.assert_any_await("SET @@session.branch = ''")
         _, kwargs = cache.release.call_args
-        assert kwargs.get("discard") is False
+        assert kwargs.get("discard") is True
 
     async def test_execute_sets_branch_before_user_sql_and_restores_after(self):
         from server.core.sql_gateway import SQLGateway

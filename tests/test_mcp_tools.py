@@ -227,11 +227,11 @@ class TestListTools:
         assert "branch" in run_sql["inputSchema"]["properties"]
         _assert_nullable_string_schema(run_sql["inputSchema"]["properties"]["branch"])
 
-    async def test_run_sql_transaction_has_no_branch_param(self, client, auth_headers):
+    async def test_run_sql_transaction_has_branch_param(self, client, auth_headers):
         resp = await client.get("/mcp/rest/tools", headers=auth_headers)
         tools = resp.json()["tools"]
         transaction = next(t for t in tools if t["name"] == "run_sql_transaction")
-        assert "branch" not in transaction["inputSchema"]["properties"]
+        _assert_nullable_string_schema(transaction["inputSchema"]["properties"]["branch"])
 
     async def test_branch_tool_optional_params_are_nullable(self, client, auth_headers):
         resp = await client.get("/mcp/rest/tools", headers=auth_headers)
@@ -383,10 +383,15 @@ class TestBranchTools:
         assert payload == {"branch_name": "br_new", "status": "created"}
 
     async def test_delete_branch_success(self, client, auth_headers, setup_data):
-        resp = await client.post("/mcp/rest/delete_branch", json={
-            "instance_id": setup_data["instance"].id,
-            "branch_name": "br_old",
-        }, headers=auth_headers)
+        gateway = SimpleNamespace(execute=AsyncMock(side_effect=[
+            {"columns": ["Branch"], "rows": [["MAIN"], ["br_old"]]},
+            {"row_count": 0},
+        ]))
+        with patch("server.mcp.tools.branch_handler.get_gateway", return_value=gateway):
+            resp = await client.post("/mcp/rest/delete_branch", json={
+                "instance_id": setup_data["instance"].id,
+                "branch_name": "br_old",
+            }, headers=auth_headers)
 
         assert resp.status_code == 200
         payload = json.loads(resp.json()["content"][0]["text"])
@@ -403,6 +408,7 @@ class TestBranchTools:
                 "truncated": False,
             },
             {"columns": [], "rows": [], "row_count": 0, "truncated": False},
+            {"columns": ["Branch"], "rows": [["br_old"]]},
             {"columns": [], "rows": [], "row_count": 0, "truncated": False},
         ]))
 
@@ -426,10 +432,12 @@ class TestBranchTools:
             setup_data["instance"].id,
             setup_data["instance"].id,
             setup_data["instance"].id,
+            setup_data["instance"].id,
         ]
         assert [call.kwargs["sql"] for call in gateway.execute.await_args_list] == [
             "SHOW BRANCHES",
             "CREATE BRANCH br_new",
+            "SHOW BRANCHES",
             "DROP BRANCH br_old",
         ]
 
@@ -444,6 +452,7 @@ class TestBranchTools:
                 "truncated": False,
             },
             {"columns": [], "rows": [], "row_count": 0, "truncated": False},
+            {"columns": ["Branch"], "rows": [["br_old"]]},
             {"columns": [], "rows": [], "row_count": 0, "truncated": False},
         ]))
 
@@ -475,10 +484,12 @@ class TestBranchTools:
             setup_data["instance"].id,
             setup_data["instance"].id,
             setup_data["instance"].id,
+            setup_data["instance"].id,
         ]
         assert [call.kwargs["sql"] for call in gateway.execute.await_args_list] == [
             "SHOW BRANCHES",
             "CREATE BRANCH br_new",
+            "SHOW BRANCHES",
             "DROP BRANCH br_old",
         ]
 
@@ -613,6 +624,9 @@ class TestRunSQL:
                 "/mcp/rest/create_branch",
                 {"branch_name": "safe_branch"},
             ),
+            ("/mcp/rest/run_sql", {"sql": "SELECT 1", "branch": "feature"}),
+            ("/mcp/rest/run_sql_transaction", {"sql_statements": ["SELECT 1"], "branch": "feature"}),
+            ("/mcp/rest/describe_schema", {"branch": "feature"}),
         ],
     )
     async def test_provisioning_prerequisite_errors_are_sanitized_for_all_callers(
@@ -644,7 +658,7 @@ class TestRunSQL:
                 "server.mcp.tools.handlers.create_db_account",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError(sentinel),
-            ),
+            ) as create_account,
         ):
             response = await client.post(
                 path,
@@ -655,10 +669,18 @@ class TestRunSQL:
         assert response.status_code == 200
         body = response.json()
         assert body["isError"] is True
+        branch_access = "branch" in payload or path.endswith("create_branch")
         assert json.loads(body["content"][0]["text"]) == {
             "error": "CONNECTION_ERROR",
-            "message": "Database account provisioning failed.",
+            "message": (
+                "An existing database credential is required for branch access."
+                if branch_access else "Database account provisioning failed."
+            ),
         }
+        if branch_access:
+            create_account.assert_not_awaited()
+        else:
+            create_account.assert_awaited_once()
         assert sentinel not in caplog.text
         async with engine_mod._session_factory() as session:
             audit = (
@@ -668,6 +690,9 @@ class TestRunSQL:
                     .order_by(AuditLog.created_at.desc())
                 )
             ).scalars().first()
+        if branch_access:
+            assert audit is None  # No provisioning was attempted.
+            return
         assert audit is not None
         assert audit.status == AuditStatus.ERROR
         assert audit.error_code == "CONNECTION_ERROR"
@@ -884,8 +909,13 @@ class TestRunSQL:
         payload = json.loads(result["content"][0]["text"])
         assert payload["error"] == "INVALID_IDENTIFIER"
 
+    @pytest.mark.parametrize("sql", [
+        "SET @@session.branch = 'br2'", "PREPARE s FROM 'SELECT 1'",
+        "EXECUTE s", "DEALLOCATE PREPARE s", "CALL switch_branch()",
+        "/*!50000 CALL switch_branch() */",
+    ])
     async def test_run_sql_rejects_session_branch_sql_when_branch_requested(
-        self, client, auth_headers, setup_data
+        self, client, auth_headers, setup_data, sql
     ):
         gateway = SimpleNamespace(execute=AsyncMock())
 
@@ -894,7 +924,7 @@ class TestRunSQL:
             patch("server.mcp.tools.handlers.log_audit", new_callable=AsyncMock) as log,
         ):
             resp = await client.post("/mcp/rest/run_sql", json={
-                "sql": "SET @@session.branch = 'br2'",
+                "sql": sql,
                 "instance_id": setup_data["instance"].id,
                 "branch": "br1",
             }, headers=auth_headers)
@@ -1517,6 +1547,22 @@ class TestTwoPhaseConfirmation:
 
 
 class TestRunSQLTransaction:
+    async def test_transaction_branch_contract(self, client, auth_headers, setup_data):
+        gateway = SimpleNamespace(execute_transaction=AsyncMock(return_value=[]))
+        arguments = {"sql_statements": ["SELECT 1"], "instance_id": setup_data["instance"].id, "branch": "isolated"}
+        with patch("server.mcp.tools.handlers.get_gateway", return_value=gateway):
+            response = await client.post("/mcp/rest/run_sql_transaction", json=arguments, headers=auth_headers)
+            payload = json.loads(response.json()["content"][0]["text"])
+            assert payload["branch"] == "isolated"
+            assert gateway.execute_transaction.call_args.kwargs["branch"] == "isolated"
+            gateway.execute_transaction.reset_mock()
+            for branch, statements in [("bad;branch", ["SELECT 1"]), ("isolated", ["SET @@session.branch = 'other'"])]:
+                response = await client.post("/mcp/rest/run_sql_transaction", json={**arguments, "branch": branch, "sql_statements": statements}, headers=auth_headers)
+                assert response.json()["isError"]
+            gateway.execute_transaction.assert_not_awaited()
+            response = await client.post("/mcp/rest/run_sql_transaction", json={**arguments, "sql_statements": ["DROP TABLE t"]}, headers=auth_headers)
+            assert "Branch: isolated" in response.json()["content"][0]["text"]
+
     async def test_transaction_success(self, client, auth_headers, setup_data):
         resp = await client.post("/mcp/rest/run_sql_transaction", json={
             "sql_statements": ["INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"],

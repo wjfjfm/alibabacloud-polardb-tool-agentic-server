@@ -141,6 +141,46 @@ def _patches(gateway, mock_instance, tenant_name=None):
     )
 
 
+@pytest.mark.asyncio
+async def test_branch_schema_uses_selected_database_show(mock_user, mock_instance, mock_db_account):
+    gateway = MagicMock()
+    gateway.execute_parameterized = AsyncMock(side_effect=[
+        {"columns": ["Name", "Engine", "Comment", "Rows", "Create_time"],
+         "rows": [["z", "InnoDB", "branch only", 2, None], ["view", None, "", 0, None], ["a`%", "InnoDB", "", 1, None]]},
+        {"columns": ["Field", "Type", "Comment"], "rows": [["id", "int", "key"]]},
+    ])
+    p1, p2, p3, p4 = _patches(gateway, mock_instance)
+    with p1, p2, p3, p4:
+        result = await handle_describe_schema(mock_user, _make_session(mock_db_account),
+            database="db", branch="isolated", max_tables=1, table_pattern="%")
+    data = json.loads(result["content"][0]["text"])
+    assert data["branch"] == "isolated"
+    assert data["has_more"] is True
+    assert data["tables"][0]["table_name"] == "a`%"
+    assert data["tables"][0]["columns"] == [{"name": "id", "type": "int", "comment": "key"}]
+    calls = gateway.execute_parameterized.call_args_list
+    assert calls[0].kwargs["sql"] == "SHOW TABLE STATUS LIKE %s"
+    assert calls[0].kwargs["params"] == ["%"]
+    assert calls[1].kwargs["sql"] == "SHOW FULL COLUMNS FROM `a``%%`"
+    assert all(call.kwargs["branch"] == "isolated" for call in calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("branch", ["bad name", "x;DROP", 42])
+async def test_schema_rejects_invalid_branch_before_resolution(mock_user, branch):
+    with patch("server.mcp.tools.schema_handler.resolve_target_instance", AsyncMock()) as resolve:
+        result = await handle_describe_schema(mock_user, AsyncMock(), branch=branch)
+    assert result["isError"] is True
+    resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_schema_rejects_invalid_workspace_branch_before_resolution(mock_user):
+    with patch("server.mcp.tools.schema_handler._is_agent_actor", return_value=True):
+        result = await handle_describe_schema(mock_user, AsyncMock(), branch="invalid;branch")
+    assert result["isError"] is True
+
+
 class TestDescribeSchemaEmpty:
     @pytest.mark.asyncio
     async def test_no_tables(self, mock_user, mock_instance, mock_db_account):
